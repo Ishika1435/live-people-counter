@@ -52,10 +52,6 @@ Uses only:
 
 ---
 
-## 📁 Repository Structure
-
-### **Main Branch (`main`) – DeepSORT**
-
 
 ## 📁 Repository Structure
 
@@ -81,48 +77,54 @@ Uses only:
 
 ### 1. Install dependencies
 
-`pip install -r requirements.txt`
+```bash
+pip install -r requirements.txt
+```
 
 
 ### 2. Add YOLOv5 model
-`Place your trained `.pt` file here (not uploaded to GitHub):`
+```bash
+Place your trained `.pt` file here (not uploaded to GitHub):
+```
 
 Ensure the path is correctly set inside `app.py`.
 
 ### 3. Run the application
-
-`python app.py`
-
+```bash
+python app.py
+```
 
 ---
 
 ## 🚀 How to Run (IoU Version)
 
 ### 1. Switch to IoU branch
-
-`git checkout iou-version`
-
+```bash
+git checkout iou-version
+```
 
 ### 2. Install dependencies
-
-`pip install -r requirements.txt`
+```bash
+pip install -r requirements.txt
+```
 
 ### 3. Add YOLOv5 model
-`Place your trained `.pt` file here (not uploaded to GitHub):`
-
+```bash
+Place your trained `.pt` file here (not uploaded to GitHub):
+```
 Ensure the path is correctly set inside `iou.py`.
 
 
 ### 4. Start IoU tracker
-
-`python iou.py`
-
+```bash
+python iou.py
+```
 
 ---
 
 ## 🔮 Future Enhancements
 
-- **Exit counting (not implemented yet)**
+- **Exit counting**
 - ByteTrack integration  
 - Multi-camera analytics  
 - Real-time dashboards  
