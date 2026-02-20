@@ -9,13 +9,11 @@ import numpy as np
 from datetime import datetime
 from flask import Flask, render_template, Response, request
 from multiprocessing import Process, Manager, Queue, freeze_support
-from deep_sort_realtime.deepsort_tracker import DeepSort
 from models.common import DetectMultiBackend
 from utils.torch_utils import select_device
 from utils.general import non_max_suppression, scale_boxes
 from utils.augmentations import letterbox
 import torch.backends.cudnn as cudnn
-
 
 # ================= CONFIG =================
 
@@ -25,32 +23,21 @@ WEIGHTS = r"C:\Users\Admin\Desktop\live-head-count\crowdhuman_yolov5m.pt"
 #VIDEO_SOURCE = "rtsp://username:password@camera_ip:554/stream"
 
 CAMERAS = {
-    1: {
-        "source": r"C:\Users\Admin\Desktop\live-head-count\CCTV_Crowd_Entrance_Video_Generation.mp4",
-        "entry_line": 500
-    },
-    2: {
-        "source": r"C:\Users\Admin\Desktop\live-head-count\Realistic_Crowd_Surveillance_Video_Generation.mp4",
-        "entry_line": 450
-    },
-    3: {
-        "source": r"C:\Users\Admin\Desktop\live-head-count\crowd-2.mp4",
-        "entry_line": 450
-    },
-    4: {
-        "source": r"C:\Users\Admin\Desktop\live-head-count\Realistic_CCTV_School_Entrance_Video (1).mp4",
-        "entry_line": 400
-    },
+    1: {"source": r"C:\Users\Admin\Desktop\live-head-count\CCTV_Crowd_Entrance_Video_Generation.mp4", "entry_line": 500},
+    2: {"source": r"C:\Users\Admin\Desktop\live-head-count\Realistic_Crowd_Surveillance_Video_Generation.mp4", "entry_line": 450},
+    3: {"source": r"C:\Users\Admin\Desktop\live-head-count\crowd-2.mp4", "entry_line": 450},
+    4: {"source": r"C:\Users\Admin\Desktop\live-head-count\Realistic_CCTV_School_Entrance_Video (1).mp4", "entry_line": 400},
 }
 
-IMG_SIZE = 384
+IMG_SIZE = 512
 CONF_THRES = 0.4
 IOU_THRES = 0.3
 ROI_MARGIN = 120
 BATCH_SIZE = 25
+IOU_MATCH_THRESHOLD = 0.3
+MAX_AGE = 30
 
 cudnn.benchmark = True
-
 app = Flask(__name__)
 
 # ================= DATABASE =================
@@ -68,6 +55,21 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
+# ================= IOU FUNCTION =================
+
+def compute_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+
+    return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
 
 # ================= INFERENCE PROCESS =================
 
@@ -106,7 +108,7 @@ def inference_worker(frame_queue, result_dict):
                     x1, y1, x2, y2 = map(int, xyxy)
                     y1 += roi_top
                     y2 += roi_top
-                    detections.append(([x1, y1, x2-x1, y2-y1], float(conf)))
+                    detections.append([x1, y1, x2, y2])
 
         result_dict[cam_id] = detections
 
@@ -117,11 +119,12 @@ def camera_worker(cam_id, config, frame_dict, frame_queue, result_dict):
     source = config["source"]
     entry_line = config["entry_line"]
 
-    tracker = DeepSort(max_age=10, n_init=2, embedder="mobilenet", half=True, bgr=True)
-
     conn = sqlite3.connect("events.db", check_same_thread=False)
     cursor = conn.cursor()
     event_buffer = []
+
+    tracks = {}
+    next_track_id = 0
 
     previous_y = {}
     counted_ids = set()
@@ -141,21 +144,33 @@ def camera_worker(cam_id, config, frame_dict, frame_queue, result_dict):
 
     while True:
         ret, frame = cap.read()
+
         if not ret:
-            print(f"Camera {cam_id} finished.")
-            break
+            print(f"[Camera {cam_id}] Connection lost. Attempting reconnect...")
+
+            cap.release()
+            time.sleep(2)
+
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            retry_count = 0
+            while not cap.isOpened():
+                retry_count += 1
+                print(f"[Camera {cam_id}] Reconnect attempt {retry_count}")
+                time.sleep(2)
+                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+
+            print(f"[Camera {cam_id}] Reconnected successfully.")
+            continue
+
 
         now = datetime.now().strftime("%Y-%m-%d_%H")
         if current_hour != now:
             if out:
                 out.release()
             filename = f"output/camera_{cam_id}/{now}.mp4"
-            out = cv2.VideoWriter(
-                filename,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                fps,
-                (width, height)
-            )
+            out = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             current_hour = now
 
         roi_top = max(0, entry_line - ROI_MARGIN)
@@ -169,51 +184,63 @@ def camera_worker(cam_id, config, frame_dict, frame_queue, result_dict):
 
         detections = result_dict.pop(cam_id)
 
-        formatted_detections = [
-            (d[0], d[1], "head") for d in detections
-        ]
+        updated_tracks = {}
+        used_detections = set()
 
-        tracks = tracker.update_tracks(
-            formatted_detections,
-            frame=frame
-        )
+        # Match existing tracks
+        for tid, track_box in tracks.items():
+            best_iou = 0
+            best_det = -1
+            for i, det in enumerate(detections):
+                if i in used_detections:
+                    continue
+                iou = compute_iou(track_box["box"], det)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det = i
 
+            if best_iou > IOU_MATCH_THRESHOLD:
+                updated_tracks[tid] = {"box": detections[best_det], "age": 0}
+                used_detections.add(best_det)
+            else:
+                track_box["age"] += 1
+                if track_box["age"] < MAX_AGE:
+                    updated_tracks[tid] = track_box
 
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
+        # Add new tracks
+        for i, det in enumerate(detections):
+            if i not in used_detections:
+                updated_tracks[next_track_id] = {"box": det, "age": 0}
+                next_track_id += 1
 
-            l, t, r, b = track.to_ltrb()
-            cy = int((t + b) / 2)
+        tracks = updated_tracks
 
-            if track.track_id not in previous_y:
-                previous_y[track.track_id] = cy
+        # Counting logic (unchanged)
+        for tid, data in tracks.items():
+            x1, y1, x2, y2 = data["box"]
+            cy = int((y1 + y2) / 2)
 
-            if previous_y[track.track_id] < entry_line and cy >= entry_line:
-                if track.track_id not in counted_ids:
-                    counted_ids.add(track.track_id)
+            if tid not in previous_y:
+                previous_y[tid] = cy
+
+            if previous_y[tid] < entry_line and cy >= entry_line:
+                if tid not in counted_ids:
+                    counted_ids.add(tid)
                     total_entries += 1
                     event_buffer.append((cam_id,))
 
-            previous_y[track.track_id] = cy
+            previous_y[tid] = cy
 
-            cv2.rectangle(frame, (int(l), int(t)), (int(r), int(b)), (0,255,0), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
 
         if len(event_buffer) >= BATCH_SIZE:
-            cursor.executemany(
-                "INSERT INTO entry_events (camera_id) VALUES (?)",
-                event_buffer
-            )
+            cursor.executemany("INSERT INTO entry_events (camera_id) VALUES (?)", event_buffer)
             conn.commit()
             event_buffer.clear()
 
         cv2.line(frame, (0, entry_line), (width, entry_line), (0,0,255), 3)
-        cv2.putText(frame, f"TOTAL: {total_entries}",
-                    (20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0,255,255),
-                    2)
+        cv2.putText(frame, f"TOTAL: {total_entries}", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
 
         out.write(frame)
 
@@ -230,6 +257,7 @@ def generate(cam_id):
                    app.config["frames"][cam_id] + b'\r\n')
 
 # ================= ROUTES =================
+
 @app.route('/')
 def index():
     return render_template('index.html', cameras=CAMERAS.keys())
@@ -276,8 +304,6 @@ def report():
                            cameras=cameras,
                            results=results)
 
-
-
 # ================= MAIN =================
 
 if __name__ == "__main__":
@@ -291,18 +317,13 @@ if __name__ == "__main__":
 
     app.config["frames"] = frames
 
-    infer_process = Process(
-        target=inference_worker,
-        args=(frame_queue, results)
-    )
+    infer_process = Process(target=inference_worker, args=(frame_queue, results))
     infer_process.start()
 
     processes = []
     for cam_id, config in CAMERAS.items():
-        p = Process(
-            target=camera_worker,
-            args=(cam_id, config, frames, frame_queue, results)
-        )
+        p = Process(target=camera_worker,
+                    args=(cam_id, config, frames, frame_queue, results))
         p.start()
         processes.append(p)
 
